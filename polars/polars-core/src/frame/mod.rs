@@ -4,6 +4,7 @@ use std::iter::{FromIterator, Iterator};
 use std::{mem, ops};
 
 use ahash::AHashSet;
+use hashbrown::{HashMap, HashSet};
 use polars_arrow::prelude::QuantileInterpolOptions;
 use rayon::prelude::*;
 
@@ -140,6 +141,26 @@ pub fn _duplicate_err(name: &str) -> PolarsResult<()> {
     Err(PolarsError::Duplicate(
         format!("Column with name: '{name}' has more than one occurrences").into(),
     ))
+}
+
+#[derive(Debug, Copy, Clone, Default)]
+pub enum VStackColumns {
+    /// Keep columns present in any of the DataFrames
+    #[default]
+    Union,
+    /// Only keep columns present in all of the DataFrames
+    Intersection,
+    /// Require that the DataFrames have all of the same columns, but potentially in
+    /// different orders. The output DataFrame will have the same column order as the
+    /// first concatenated DataFrame.
+    RequireEqualUnordered,
+    /// Require that the DataFrames have all the same columns in the same order.
+    RequireIdenticalInOrder,
+}
+
+#[derive(Debug, Default)]
+pub struct VStackOptions {
+    pub columns: VStackColumns,
 }
 
 impl DataFrame {
@@ -859,9 +880,9 @@ impl DataFrame {
     /// | Palladium | 1828.05           |
     /// +-----------+-------------------+
     /// ```
-    pub fn vstack(&self, other: &DataFrame) -> PolarsResult<Self> {
+    pub fn vstack(&self, other: &DataFrame, options: VStackOptions) -> PolarsResult<Self> {
         let mut df = self.clone();
-        df.vstack_mut(other)?;
+        df.vstack_mut(other, options)?;
         Ok(df)
     }
 
@@ -905,26 +926,190 @@ impl DataFrame {
     /// | Palladium | 1828.05           |
     /// +-----------+-------------------+
     /// ```
-    pub fn vstack_mut(&mut self, other: &DataFrame) -> PolarsResult<&mut Self> {
-        if self.width() != other.width() {
-            if self.width() == 0 {
-                self.columns = other.columns.clone();
-                return Ok(self);
-            }
-
-            return Err(PolarsError::ShapeMisMatch(
-                format!("Could not vertically stack DataFrame. The DataFrames appended width {} differs from the parent DataFrames width {}", self.width(), other.width()).into()
-            ));
+    pub fn vstack_mut(
+        &mut self,
+        other: &DataFrame,
+        options: VStackOptions,
+    ) -> PolarsResult<&mut Self> {
+        /// Try to append `right` to `left`. Returns an `Err` if the dtypes don't match,
+        /// otherwise `Ok(())`.
+        fn try_append(left: &mut Series, right: &Series) -> PolarsResult<()> {
+            can_extend_dtype(left, right)?;
+            assert_append(left, right);
+            Ok(())
         }
 
-        self.columns
-            .iter_mut()
-            .zip(other.columns.iter())
-            .try_for_each::<_, PolarsResult<_>>(|(left, right)| {
-                can_extend(left, right)?;
-                left.append(right).expect("should not fail");
-                Ok(())
-            })?;
+        fn assert_append(left: &mut Series, right: &Series) {
+            left.append(right).expect("should not fail");
+        }
+
+        let self_initial_height = self.height();
+        let VStackOptions {
+            columns: col_option,
+        } = options;
+
+        // df.column(name) is O(df.columns.len()), so we risk quadratic behavior if we
+        // don't pre-collect into hashmaps when checking for the existence of columns in
+        // a df
+        let right_cols = other
+            .columns
+            .iter()
+            .map(|col| (col.name(), col))
+            .collect::<HashMap<_, _>>();
+
+        match col_option {
+            VStackColumns::Union => {
+                if self.width() == 0 {
+                    self.columns = other.columns.clone();
+                    return Ok(self);
+                }
+
+                // For each col in self, append matching col in other if it exists,
+                // otherwise append nulls
+                for left in &mut self.columns {
+                    let name = left.name();
+                    match right_cols.get(name) {
+                        Some(right) => {
+                            try_append(left, right)?;
+                        }
+                        None => {
+                            let right = Series::full_null(name, other.height(), left.dtype());
+                            assert_append(left, &right);
+                        }
+                    }
+                }
+
+                let left_cols = self
+                    .columns
+                    .iter()
+                    .map(|col| (col.name(), col))
+                    .collect::<HashMap<_, _>>();
+
+                let mut cols_to_append = Vec::new();
+                // Append all the cols in other that are not present in self, prepending with nulls
+                for right in &other.columns {
+                    let name = right.name();
+                    match left_cols.get(name) {
+                        Some(_) => {} // already handled above
+                        None => {
+                            let mut left =
+                                Series::full_null(name, self_initial_height, right.dtype());
+                            assert_append(&mut left, right);
+                            cols_to_append.push(left);
+                        }
+                    }
+                }
+
+                drop(left_cols);
+                for col in cols_to_append {
+                    self.with_column(col)
+                        .expect("log error: could not append column to self in vstack_mut");
+                }
+            }
+            VStackColumns::Intersection => {
+                if self.width() == 0 {
+                    return Ok(self);
+                }
+
+                let mut colnames_to_keep = HashSet::<_>::new();
+                for left in &mut self.columns {
+                    let name = left.name().to_owned();
+                    if let Some(right) = right_cols.get(name.as_str()) {
+                        colnames_to_keep.insert(name);
+                        try_append(left, right)?;
+                    }
+                }
+
+                self.columns
+                    .retain(|col| colnames_to_keep.contains(col.name()));
+            }
+            VStackColumns::RequireEqualUnordered => {
+                let left_colnames = self
+                    .columns
+                    .iter()
+                    .map(|col| col.name().to_owned())
+                    .collect::<HashSet<_>>();
+
+                let have_same_colnames = self.columns.len() == other.columns.len()
+                    && left_colnames
+                        .iter()
+                        .all(|left_name| right_cols.contains_key(left_name.as_str()));
+
+                if !have_same_colnames {
+                    let left_not_in_right = left_colnames
+                        .iter()
+                        .filter(|left_name| !right_cols.contains_key(left_name.as_str()))
+                        .collect::<Vec<_>>();
+                    let right_not_in_left = right_cols
+                        .keys()
+                        .filter(|&&right_name| !left_colnames.contains(right_name))
+                        .collect::<Vec<_>>();
+
+                    return Err(PolarsError::ShapeMisMatch(
+                        format!(
+                            "Could not vertically stack DataFrame. \
+                             options.col_option` was {:?}, which requires that the DataFrames have the same columns \
+                             (not necessarily in the same order). \
+                             Use VStackColumnsMethod::Union or VStackColumnsMethod::Intersection \
+                             to handle DataFrames with different columns.\n\
+                             The following columns were present in the left DataFrame, but not the right:\n    {:?}
+                             The following columns were present in the right DataFrame, but not the left:\n    {:?}",
+                            col_option,
+                            left_not_in_right,
+                            right_not_in_left
+                        )
+                        .into(),
+                    ));
+                }
+
+                for left in &mut self.columns {
+                    let name = left.name();
+                    let right = right_cols.get(name).unwrap_or_else(||panic!("logic error: in vstack_mut, column {name:?} in self unexpectedly not found in other"));
+                    try_append(left, right)?;
+                }
+            }
+            VStackColumns::RequireIdenticalInOrder => {
+                let have_same_ordered_colnames = self.columns.len() == other.columns.len()
+                    && self
+                        .columns
+                        .iter()
+                        .zip(&other.columns)
+                        .all(|(left, right)| left.name() == right.name());
+
+                if !have_same_ordered_colnames {
+                    let left_names = self
+                        .columns
+                        .iter()
+                        .map(|c| c.name().to_owned())
+                        .collect::<Vec<_>>();
+                    let right_names = other.columns.iter().map(|c| c.name()).collect::<Vec<_>>();
+
+                    return Err(PolarsError::ShapeMisMatch(
+                        format!(
+                            "Could not vertically stack DataFrame. \
+                             options.col_option` was {:?}, which requires that the DataFrames have the same columns \
+                             in the same order. \
+                             Use VStackColumnsMethod::SameUnordered to relax the condition that the columns must be \
+                             in the same order, or VStackColumnsMethod::Union or VStackColumnsMethod::Intersection \
+                             to handle DataFrames with different columns altogether.\n\
+                             The left DataFrame's columns were:\n    {:?}
+                             The right DataFrame's columns were:\n    {:?}",
+                            col_option,
+                            left_names,
+                            right_names
+                        )
+                        .into(),
+                    ));
+                }
+
+                for left in &mut self.columns {
+                    let name = left.name();
+                    let right = right_cols.get(name).unwrap_or_else(||panic!("logic error: in vstack_mut, column {name:?} in self unexpectedly not found in other"));
+                    try_append(left, right)?;
+                }
+            }
+        }
+
         Ok(self)
     }
 
@@ -1585,7 +1770,13 @@ impl DataFrame {
         let mut iter = dfs?.into_iter();
         let first = iter.next().unwrap();
         Ok(iter.fold(first, |mut acc, df| {
-            acc.vstack_mut(&df).unwrap();
+            acc.vstack_mut(
+                &df,
+                VStackOptions {
+                    columns: VStackColumns::RequireIdenticalInOrder,
+                },
+            )
+            .unwrap();
             acc
         }))
     }
@@ -3444,11 +3635,9 @@ impl From<DataFrame> for Vec<Series> {
     }
 }
 
-// utility to test if we can vstack/extend the columns
-fn can_extend(left: &Series, right: &Series) -> PolarsResult<()> {
-    if left.dtype() != right.dtype() || left.name() != right.name() {
-        if left.dtype() != right.dtype() {
-            return Err(PolarsError::SchemaMisMatch(
+fn can_extend_dtype(left: &Series, right: &Series) -> PolarsResult<()> {
+    if left.dtype() != right.dtype() {
+        return Err(PolarsError::SchemaMisMatch(
                 format!(
                     "cannot vstack: because column datatypes (dtypes) in the two DataFrames do not match for \
                                 left.name='{}' with left.dtype={} != right.dtype={} with right.name='{}'",
@@ -3459,23 +3648,37 @@ fn can_extend(left: &Series, right: &Series) -> PolarsResult<()> {
                 )
                     .into(),
             ));
-        } else {
-            return Err(PolarsError::SchemaMisMatch(
-                format!(
-                    "cannot vstack: because column names in the two DataFrames do not match for \
+    }
+    Ok(())
+}
+
+fn can_extend_name(left: &Series, right: &Series) -> PolarsResult<()> {
+    if left.name() != right.name() {
+        return Err(PolarsError::SchemaMisMatch(
+            format!(
+                "cannot vstack: because column names in the two DataFrames do not match for \
                                 left.name='{}' != right.name='{}'",
-                    left.name(),
-                    right.name()
-                )
-                .into(),
-            ));
-        }
-    };
+                left.name(),
+                right.name()
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+// utility to test if we can vstack/extend the columns
+fn can_extend(left: &Series, right: &Series) -> PolarsResult<()> {
+    can_extend_dtype(left, right)?;
+    can_extend_name(left, right)?;
+
     Ok(())
 }
 
 #[cfg(test)]
 mod test {
+    use std::fmt::Debug;
+
     use super::*;
     use crate::frame::NullStrategy;
 
@@ -3600,7 +3803,7 @@ mod test {
     }
 
     #[test]
-    fn test_vstack() {
+    fn test_vstack_rechunk() {
         // check that it does not accidentally rechunks
         let mut df = df! {
             "flt" => [1., 1., 2., 2., 3., 3.],
@@ -3609,8 +3812,331 @@ mod test {
         }
         .unwrap();
 
-        df.vstack_mut(&df.slice(0, 3)).unwrap();
-        assert_eq!(df.n_chunks(), 2)
+        df.vstack_mut(
+            &df.slice(0, 3),
+            VStackOptions {
+                columns: VStackColumns::RequireIdenticalInOrder,
+            },
+        )
+        .unwrap();
+        assert_eq!(df.n_chunks(), 2);
+    }
+
+    #[test]
+    fn test_vstack_options() {
+        // check functionality of the options parameter
+        use VStackColumns::*;
+
+        fn someify<T>(items: Vec<T>) -> Vec<Option<T>> {
+            items.into_iter().map(|x| Some(x)).collect()
+        }
+
+        #[track_caller]
+        fn assert_series_eq<'a, T, U>(
+            df: &'a DataFrame,
+            colname: &str,
+            series_to_ca_fn: impl Fn(&'a Series) -> PolarsResult<&'a ChunkedArray<T>>,
+            expected: Vec<Option<U>>,
+        ) where
+            T: 'a + PolarsDataType,
+            U: Debug + PartialEq<U>,
+            &'a ChunkedArray<T>: IntoIterator<Item = Option<U>>,
+        {
+            let series = df.column(colname).unwrap();
+            let ca = series_to_ca_fn(series).unwrap();
+            let actual = ca.into_iter().collect::<Vec<_>>();
+            assert_eq!(expected, actual);
+        }
+
+        fn vstack_anew(
+            df1: &DataFrame,
+            df2: &DataFrame,
+            col_option: VStackColumns,
+        ) -> PolarsResult<DataFrame> {
+            let mut df = df1.clone();
+            df.vstack_mut(
+                df2,
+                VStackOptions {
+                    columns: col_option,
+                },
+            )?;
+            Ok(df)
+        }
+
+        const EMPTY: Vec<&str> = vec![];
+
+        // columns are named after the first letter of their type (i => i32, f => f64, s
+        // => str, b => bool).
+        let df1 = df! {
+            "i" => [1, 2, 3],
+            "f" => [10.0, 20.0, 30.0],
+            "s" => ["a", "b", "c"],
+        }
+        .unwrap();
+        let df2 = df! {
+            "f" => [40.0, 50.0, 60.0],
+            "i" => [4, 5, 6],
+            "s" => ["d", "e", "f"],
+        }
+        .unwrap();
+        let df3 = df! {
+            "b" => [true, false, true],
+            "s" => ["x", "y", "z"],
+            "f" => [100.0, 200.0, 300.0],
+        }
+        .unwrap();
+
+        // VStackColsMethod variants should all be equivalent when vstacking a df and
+        // itself
+        for col_option in [
+            Union,
+            Intersection,
+            RequireEqualUnordered,
+            RequireIdenticalInOrder,
+        ] {
+            let df = vstack_anew(&df1, &df1, col_option).unwrap();
+            assert_series_eq(&df, "i", |s| s.i32(), someify(vec![1, 2, 3, 1, 2, 3]));
+            assert_series_eq(
+                &df,
+                "f",
+                |s| s.f64(),
+                someify(vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0]),
+            );
+            assert_series_eq(
+                &df,
+                "s",
+                |s| s.utf8(),
+                someify(vec!["a", "b", "c", "a", "b", "c"]),
+            );
+            assert_eq!(df.get_column_names(), vec!["i", "f", "s"]);
+        }
+
+        // df2 is df1 with reordered columns, so they should all work the same except SameOrdered
+        for col_option in [Union, Intersection, RequireEqualUnordered] {
+            let df = vstack_anew(&df1, &df2, col_option).unwrap();
+            assert_series_eq(&df, "i", |s| s.i32(), someify(vec![1, 2, 3, 4, 5, 6]));
+            assert_series_eq(
+                &df,
+                "f",
+                |s| s.f64(),
+                someify(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]),
+            );
+            assert_series_eq(
+                &df,
+                "s",
+                |s| s.utf8(),
+                someify(vec!["a", "b", "c", "d", "e", "f"]),
+            );
+            assert_eq!(df.get_column_names(), vec!["i", "f", "s"]);
+        }
+
+        assert!(vstack_anew(&df1, &df2, RequireIdenticalInOrder).is_err());
+
+        // df3 has different columns from df1 so this is the first "real" test
+        let df = vstack_anew(&df1, &df3, Union).unwrap();
+        assert_series_eq(
+            &df,
+            "i",
+            |s| s.i32(),
+            vec![Some(1), Some(2), Some(3), None, None, None],
+        );
+        assert_series_eq(
+            &df,
+            "f",
+            |s| s.f64(),
+            someify(vec![10.0, 20.0, 30.0, 100.0, 200.0, 300.0]),
+        );
+        assert_series_eq(
+            &df,
+            "s",
+            |s| s.utf8(),
+            someify(vec!["a", "b", "c", "x", "y", "z"]),
+        );
+        assert_series_eq(
+            &df,
+            "b",
+            |s| s.bool(),
+            vec![None, None, None, Some(true), Some(false), Some(true)],
+        );
+        assert_eq!(df.get_column_names(), vec!["i", "f", "s", "b"]);
+
+        let df = vstack_anew(&df1, &df3, Intersection).unwrap();
+        assert_series_eq(
+            &df,
+            "f",
+            |s| s.f64(),
+            someify(vec![10.0, 20.0, 30.0, 100.0, 200.0, 300.0]),
+        );
+        assert_series_eq(
+            &df,
+            "s",
+            |s| s.utf8(),
+            someify(vec!["a", "b", "c", "x", "y", "z"]),
+        );
+        assert_eq!(df.get_column_names(), vec!["f", "s"]);
+
+        for col_option in [RequireEqualUnordered, RequireIdenticalInOrder] {
+            assert!(vstack_anew(&df1, &df3, col_option).is_err());
+        }
+
+        // repeat the df1+df3 test, but with df3+df1 to test that the output column
+        // order is what we expect: b, s, f, i
+        let df = vstack_anew(&df3, &df1, Union).unwrap();
+        assert_series_eq(
+            &df,
+            "b",
+            |s| s.bool(),
+            vec![Some(true), Some(false), Some(true), None, None, None],
+        );
+        assert_series_eq(
+            &df,
+            "s",
+            |s| s.utf8(),
+            someify(vec!["x", "y", "z", "a", "b", "c"]),
+        );
+        assert_series_eq(
+            &df,
+            "f",
+            |s| s.f64(),
+            someify(vec![100.0, 200.0, 300.0, 10.0, 20.0, 30.0]),
+        );
+        assert_series_eq(
+            &df,
+            "i",
+            |s| s.i32(),
+            vec![None, None, None, Some(1), Some(2), Some(3)],
+        );
+        assert_eq!(df.get_column_names(), vec!["b", "s", "f", "i"]);
+
+        let df = vstack_anew(&df3, &df1, Intersection).unwrap();
+        assert_series_eq(
+            &df,
+            "s",
+            |s| s.utf8(),
+            someify(vec!["x", "y", "z", "a", "b", "c"]),
+        );
+        assert_series_eq(
+            &df,
+            "f",
+            |s| s.f64(),
+            someify(vec![100.0, 200.0, 300.0, 10.0, 20.0, 30.0]),
+        );
+        assert_eq!(df.get_column_names(), vec!["s", "f"]);
+
+        for col_option in [RequireEqualUnordered, RequireIdenticalInOrder] {
+            assert!(vstack_anew(&df3, &df1, col_option).is_err());
+        }
+
+        // some special cases:
+        // - no columns in common
+        // - 0 columns in left, > 0 in right
+        // - 0 columns in right, > 0 in left
+        // - 0 columns in both
+
+        let df_empty = DataFrame::empty();
+        let df_weird =
+            df!["c1" => [51, 52, 53], "c2" => [-1.0, -2.0, -3.0], "c3" => ["!", "@", "#"]].unwrap();
+
+        // df_1 + df_weird
+        let df = vstack_anew(&df1, &df_weird, Union).unwrap();
+        assert_series_eq(
+            &df,
+            "i",
+            |s| s.i32(),
+            vec![Some(1), Some(2), Some(3), None, None, None],
+        );
+        assert_series_eq(
+            &df,
+            "f",
+            |s| s.f64(),
+            vec![Some(10.0), Some(20.0), Some(30.0), None, None, None],
+        );
+        assert_series_eq(
+            &df,
+            "s",
+            |s| s.utf8(),
+            vec![Some("a"), Some("b"), Some("c"), None, None, None],
+        );
+        assert_series_eq(
+            &df,
+            "c1",
+            |s| s.i32(),
+            vec![None, None, None, Some(51), Some(52), Some(53)],
+        );
+        assert_series_eq(
+            &df,
+            "c2",
+            |s| s.f64(),
+            vec![None, None, None, Some(-1.0), Some(-2.0), Some(-3.0)],
+        );
+        assert_series_eq(
+            &df,
+            "c3",
+            |s| s.utf8(),
+            vec![None, None, None, Some("!"), Some("@"), Some("#")],
+        );
+        assert_eq!(df.get_column_names(), vec!["i", "f", "s", "c1", "c2", "c3"]);
+
+        let df = vstack_anew(&df1, &df_weird, Intersection).unwrap();
+        assert_eq!(df.get_column_names(), EMPTY);
+
+        for col_option in [RequireEqualUnordered, RequireIdenticalInOrder] {
+            assert!(vstack_anew(&df1, &df_weird, col_option).is_err());
+        }
+
+        // df1 + df_empty
+        let df = vstack_anew(&df1, &df_empty, Union).unwrap();
+        assert_series_eq(&df, "i", |s| s.i32(), someify(vec![1, 2, 3]));
+        assert_series_eq(&df, "f", |s| s.f64(), someify(vec![10.0, 20.0, 30.0]));
+        assert_series_eq(&df, "s", |s| s.utf8(), someify(vec!["a", "b", "c"]));
+        assert_eq!(df.get_column_names(), vec!["i", "f", "s"]);
+
+        let df = vstack_anew(&df1, &df_empty, Intersection).unwrap();
+        assert_eq!(df.get_column_names(), EMPTY);
+
+        for col_option in [RequireEqualUnordered, RequireIdenticalInOrder] {
+            assert!(vstack_anew(&df1, &df_empty, col_option).is_err());
+        }
+
+        // df_empty + df1
+        let df = vstack_anew(&df_empty, &df1, Union).unwrap();
+        assert_series_eq(&df, "i", |s| s.i32(), someify(vec![1, 2, 3]));
+        assert_series_eq(&df, "f", |s| s.f64(), someify(vec![10.0, 20.0, 30.0]));
+        assert_series_eq(&df, "s", |s| s.utf8(), someify(vec!["a", "b", "c"]));
+        assert_eq!(df.get_column_names(), vec!["i", "f", "s"]);
+
+        let df = vstack_anew(&df_empty, &df1, Intersection).unwrap();
+        assert_eq!(df.get_column_names(), EMPTY);
+
+        for col_option in [RequireEqualUnordered, RequireIdenticalInOrder] {
+            assert!(vstack_anew(&df_empty, &df1, col_option).is_err());
+        }
+
+        // df_empty + df_empty
+        for col_option in [
+            Union,
+            Intersection,
+            RequireEqualUnordered,
+            RequireIdenticalInOrder,
+        ] {
+            let df = vstack_anew(&df_empty, &df_empty, col_option).unwrap();
+            assert_eq!(df.get_column_names(), EMPTY);
+        }
+
+        // test throwing errors due to mismatched dtypes
+        let df_bad_dtypes_1 = df!["i" => ["not", "an", "int"]].unwrap();
+        let df_bad_dtypes_2 =
+            df!["i" => ["not", "an", "int"], "f" => [1, 2, 3], "s" => [-10.0, -20.0, -30.0]]
+                .unwrap();
+
+        for col_option in [Union, Intersection] {
+            assert!(vstack_anew(&df1, &df_bad_dtypes_1, col_option).is_err());
+            assert!(vstack_anew(&df1, &df_bad_dtypes_2, col_option).is_err());
+        }
+
+        for col_option in [RequireEqualUnordered, RequireIdenticalInOrder] {
+            assert!(vstack_anew(&df1, &df_bad_dtypes_2, col_option).is_err());
+        }
     }
 
     #[test]

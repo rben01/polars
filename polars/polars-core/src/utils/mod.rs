@@ -15,6 +15,7 @@ pub use {arrow, rayon};
 
 #[cfg(feature = "private")]
 pub use crate::chunked_array::ops::sort::arg_sort_no_nulls;
+use crate::frame::VStackOptions;
 use crate::prelude::*;
 use crate::POOL;
 
@@ -591,7 +592,12 @@ where
     let mut acc_df = iter.next().unwrap();
     acc_df.reserve_chunks(additional);
     for df in iter {
-        acc_df.vstack_mut(&df)?;
+        acc_df.vstack_mut(
+            &df,
+            VStackOptions {
+                columns: crate::frame::VStackColumns::RequireIdenticalInOrder,
+            },
+        )?;
     }
     Ok(acc_df)
 }
@@ -606,7 +612,12 @@ where
     let mut acc_df = iter.next().unwrap().clone();
     acc_df.reserve_chunks(additional);
     for df in iter {
-        acc_df.vstack_mut(df)?;
+        acc_df.vstack_mut(
+            df,
+            VStackOptions {
+                columns: crate::frame::VStackColumns::RequireIdenticalInOrder,
+            },
+        )?;
     }
     Ok(acc_df)
 }
