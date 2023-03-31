@@ -8,12 +8,13 @@ use crate::csv::utils::infer_file_schema;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum CsvEncoding {
-    /// Utf8 encoding
+    /// Utf8 encoding. Deserialization fails if the input is invalid UTF-8.
     Utf8,
-    /// Utf8 encoding and unknown bytes are replaced with �
+    /// Utf8 encoding and unknown bytes are replaced with �.
     LossyUtf8,
 }
 
+/// The string representation of null values in the input
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum NullValues {
@@ -102,16 +103,19 @@ where
     reader: R,
     /// Aggregates chunk afterwards to a single chunk.
     rechunk: bool,
-    /// Stop reading from the csv after this number of rows is reached
+    /// Stop reading from the csv after this number of rows is reached. `None` means the entire input will be read.
     n_rows: Option<usize>,
     // used by error ignore logic
     max_records: Option<usize>,
+    /// The number of rows between the beginning of the file and the heading row.
     skip_rows_before_header: usize,
-    /// Optional indexes of the columns to project
+    /// Optional indices of the columns to project/select. Only the columns at these indices are kept.
     projection: Option<Vec<usize>>,
-    /// Optional column names to project/ select.
+    /// Optional column names to project/select. Only the columns with these names are kept.
     columns: Option<Vec<String>>,
+    /// The delimiter (as a byte) used to separate cells. If `None`, will be set to `b','`.
     delimiter: Option<u8>,
+    /// Whether the file has a header row.
     has_header: bool,
     ignore_errors: bool,
     pub(crate) schema: Option<SchemaRef>,
@@ -196,13 +200,13 @@ where
         self
     }
 
-    /// Set whether the CSV file has headers
+    /// Set whether the CSV file has a header row.
     pub fn has_header(mut self, has_header: bool) -> Self {
         self.has_header = has_header;
         self
     }
 
-    /// Set the CSV file's column delimiter as a byte character
+    /// Set the CSV file's column delimiter as a byte character.
     pub fn with_delimiter(mut self, delimiter: u8) -> Self {
         self.delimiter = Some(delimiter);
         self

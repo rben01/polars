@@ -18,7 +18,7 @@ use polars_core::POOL;
 use polars_utils::contention_pool::LowContentionPool;
 use rayon::prelude::*;
 
-fn fmt_and_escape_str(f: &mut Vec<u8>, v: &str, options: &SerializeOptions) -> std::io::Result<()> {
+fn fmt_and_escape_str(f: &mut Vec<u8>, v: &str, options: &CsvWriterOptions) -> std::io::Result<()> {
     if v.is_empty() {
         write!(f, "\"\"")
     } else {
@@ -59,9 +59,10 @@ fn fast_float_write<N: ToLexical>(f: &mut Vec<u8>, n: N, write_size: usize) -> s
 fn write_anyvalue(
     f: &mut Vec<u8>,
     value: AnyValue,
-    options: &SerializeOptions,
-    #[allow(unused_variables)] datetime_format: Option<&str>,
+    options: &CsvWriterOptions,
 ) -> PolarsResult<()> {
+    let mut mru_datetime_format = None;
+
     match value {
         AnyValue::Null => write!(f, "{}", &options.null),
         AnyValue::Int8(v) => write!(f, "{v}"),
@@ -97,8 +98,20 @@ fn write_anyvalue(
         }
         #[cfg(feature = "dtype-datetime")]
         AnyValue::Datetime(v, tu, tz) => {
-            // If this is a datetime, then datetime_format was either set or inferred.
-            let datetime_format = datetime_format.unwrap();
+            let datetime_format = options.datetime_format.as_deref().unwrap_or(match tz {
+                Some(_) => match tu {
+                    TimeUnit::Nanoseconds => "%FT%H:%M:%S.%9f%z",
+                    TimeUnit::Microseconds => "%FT%H:%M:%S.%6f%z",
+                    TimeUnit::Milliseconds => "%FT%H:%M:%S.%3f%z",
+                },
+                None => match tu {
+                    TimeUnit::Nanoseconds => "%FT%H:%M:%S.%9f",
+                    TimeUnit::Microseconds => "%FT%H:%M:%S.%6f",
+                    TimeUnit::Milliseconds => "%FT%H:%M:%S.%3f",
+                },
+            });
+            mru_datetime_format = Some(datetime_format);
+
             let ndt = match tu {
                 TimeUnit::Nanoseconds => temporal_conversions::timestamp_ns_to_datetime(v),
                 TimeUnit::Microseconds => temporal_conversions::timestamp_us_to_datetime(v),
@@ -123,10 +136,10 @@ fn write_anyvalue(
         }
         #[cfg(feature = "dtype-time")]
         AnyValue::Time(v) => {
-            let date = temporal_conversions::time64ns_to_time(v);
+            let time = temporal_conversions::time64ns_to_time(v);
             match &options.time_format {
-                None => write!(f, "{date}"),
-                Some(fmt) => write!(f, "{}", date.format(fmt)),
+                None => write!(f, "{time}"),
+                Some(fmt) => write!(f, "{}", time.format(fmt)),
             }
         }
         ref dt => polars_bail!(ComputeError: "datatype {} cannot be written to csv", dt),
@@ -134,8 +147,8 @@ fn write_anyvalue(
     .map_err(|err| match value {
         #[cfg(feature = "dtype-datetime")]
         AnyValue::Datetime(_, _, tz) => {
-            // If this is a datetime, then datetime_format was either set or inferred.
-            let datetime_format = datetime_format.unwrap_or_default();
+            // If this is a datetime, then mru_datetime_format was definitely set.
+            let datetime_format = mru_datetime_format.unwrap();
             let type_name = if tz.is_some() {
                 "DateTime"
             } else {
@@ -149,29 +162,51 @@ fn write_anyvalue(
     })
 }
 
-/// Options to serialize logical types to CSV
+/// Options to serialize logical types to CSV. For the default values of these fields, see [`CsvWriterOptions::default`].
+///
 /// The default is to format times and dates as `chrono` crate formats them.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct SerializeOptions {
-    /// used for [`DataType::Date`]
+pub struct CsvWriterOptions {
+    /// Whether to write the header row
+    pub header: bool,
+    /// Used for [`DataType::Date`]. Will be treated as a
+    /// [`chrono::format::strftime`](https://docs.rs/chrono/latest/chrono/format/strftime/index.html) specifier.
     pub date_format: Option<String>,
-    /// used for [`DataType::Time`]
+    /// Used for [`DataType::Time`]. Will be treated as a
+    /// [`chrono::format::strftime`](https://docs.rs/chrono/latest/chrono/format/strftime/index.html) specifier.
     pub time_format: Option<String>,
-    /// used for [`DataType::Datetime]
+    /// Used for [`DataType::Datetime]. Will be treated as a
+    /// [`chrono::format::strftime`](https://docs.rs/chrono/latest/chrono/format/strftime/index.html) specifier.
     pub datetime_format: Option<String>,
-    /// used for [`DataType::Float64`] and [`DataType::Float32`]
+    /// Used for [`DataType::Float64`] and [`DataType::Float32`]
     pub float_precision: Option<usize>,
-    /// used as separator/delimiter
+    /// Used as separator/delimiter
     pub delimiter: u8,
-    /// quoting character
+    /// Quoting character
     pub quote: u8,
-    /// null value representation
+    /// Null value representation
     pub null: String,
+    /// How many rows to write at a time. Larger values lead to faster writing overall but also use more memory.
+    pub batch_size: usize,
 }
 
-impl Default for SerializeOptions {
+impl Default for CsvWriterOptions {
+    /// Uses the following options by default:
+    ///
+    /// ```ignore
+    /// header: true
+    /// date_format: None
+    /// time_format: None
+    /// datetime_format: None
+    /// float_precision: None
+    /// delimiter: b','
+    /// quote: b'"'
+    /// null: String::new()
+    /// batch_size: 1024
+    /// ```
     fn default() -> Self {
-        SerializeOptions {
+        CsvWriterOptions {
+            header: true,
             date_format: None,
             time_format: None,
             datetime_format: None,
@@ -179,6 +214,7 @@ impl Default for SerializeOptions {
             delimiter: b',',
             quote: b'"',
             null: String::new(),
+            batch_size: 1024,
         }
     }
 }
@@ -196,8 +232,7 @@ impl<'a> std::fmt::Write for StringWrap<'a> {
 pub(crate) fn write<W: Write>(
     writer: &mut W,
     df: &DataFrame,
-    chunk_size: usize,
-    options: &SerializeOptions,
+    options: &CsvWriterOptions,
 ) -> PolarsResult<()> {
     for s in df.get_columns() {
         let nested = match s.dtype() {
@@ -219,29 +254,11 @@ pub(crate) fn write<W: Write>(
     );
     let delimiter = char::from(options.delimiter);
 
-    let formats: Option<Vec<Option<&str>>> = match &options.datetime_format {
-        None => Some(
-            df.get_columns()
-                .iter()
-                .map(|col| match col.dtype() {
-                    DataType::Datetime(TimeUnit::Milliseconds, tz) => match tz {
-                        Some(_) => Some("%FT%H:%M:%S.%3f%z"),
-                        None => Some("%FT%H:%M:%S.%3f"),
-                    },
-                    DataType::Datetime(TimeUnit::Microseconds, tz) => match tz {
-                        Some(_) => Some("%FT%H:%M:%S.%6f%z"),
-                        None => Some("%FT%H:%M:%S.%6f"),
-                    },
-                    DataType::Datetime(TimeUnit::Nanoseconds, tz) => match tz {
-                        Some(_) => Some("%FT%H:%M:%S.%9f%z"),
-                        None => Some("%FT%H:%M:%S.%9f"),
-                    },
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-        ),
-        Some(_) => None,
-    };
+    let chunk_size = options.batch_size;
+    polars_ensure!(
+        chunk_size > 0,
+        ComputeError: "CsvWriterOptions.batch_size must be greater than 0",
+    );
 
     let len = df.height();
     let n_threads = POOL.current_num_threads();
@@ -286,14 +303,10 @@ pub(crate) fn write<W: Write>(
             let mut finished = false;
             // loop rows
             while !finished {
-                for (i, col) in &mut col_iters.iter_mut().enumerate() {
-                    let datetime_format = match &options.datetime_format {
-                        Some(datetime_format) => Some(datetime_format.as_str()),
-                        None => unsafe { *formats.as_ref().unwrap().get_unchecked(i) },
-                    };
+                for col in &mut col_iters.iter_mut() {
                     match col.next() {
                         Some(value) => {
-                            write_anyvalue(&mut write_buffer, value, options, datetime_format)?;
+                            write_anyvalue(&mut write_buffer, value, options)?;
                         }
                         None => {
                             finished = true;
@@ -336,7 +349,7 @@ pub(crate) fn write<W: Write>(
 pub(crate) fn write_header<W: Write>(
     writer: &mut W,
     names: &[&str],
-    options: &SerializeOptions,
+    options: &CsvWriterOptions,
 ) -> PolarsResult<()> {
     writer.write_all(
         names

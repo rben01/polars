@@ -1,15 +1,29 @@
+pub use super::write_impl::CsvWriterOptions;
 use super::*;
 
-/// Write a DataFrame to csv.
+/// Writes a DataFrame as a CSV to the specified `Write`. Construct a `CsvWriter` with [`CsvWriter::new(buffer)`].
 ///
+/// The default values of the options are below:
+/// ```ignore
+/// header: true
+/// date_format: None
+/// time_format: None
+/// datetime_format: None
+/// float_precision: None
+/// delimiter: b','
+/// quote: b'"'
+/// null: String::new()
+/// batch_size: 1024
+/// ```
+///
+/// ## Note
 /// Don't use a `Buffered` writer, the `CsvWriter` internally already buffers writes.
 #[must_use]
 pub struct CsvWriter<W: Write> {
     /// File or Stream handler
     buffer: W,
-    options: write_impl::SerializeOptions,
-    header: bool,
-    batch_size: usize,
+    /// Options to use when writing
+    options: CsvWriterOptions,
 }
 
 impl<W> SerWriter<W> for CsvWriter<W>
@@ -18,25 +32,20 @@ where
 {
     fn new(buffer: W) -> Self {
         // 9f: all nanoseconds
-        let options = write_impl::SerializeOptions {
+        let options = CsvWriterOptions {
             time_format: Some("%T%.9f".to_string()),
             ..Default::default()
         };
 
-        CsvWriter {
-            buffer,
-            options,
-            header: true,
-            batch_size: 1024,
-        }
+        CsvWriter { buffer, options }
     }
 
     fn finish(&mut self, df: &mut DataFrame) -> PolarsResult<()> {
-        let names = df.get_column_names();
-        if self.header {
+        if self.options.header {
+            let names = df.get_column_names();
             write_impl::write_header(&mut self.buffer, &names, &self.options)?;
         }
-        write_impl::write(&mut self.buffer, df, self.batch_size, &self.options)
+        write_impl::write(&mut self.buffer, df, &self.options)
     }
 }
 
@@ -44,9 +53,14 @@ impl<W> CsvWriter<W>
 where
     W: Write,
 {
+    pub fn with_options(mut self, options: CsvWriterOptions) -> Self {
+        self.options = options;
+        self
+    }
+
     /// Set whether to write headers
     pub fn has_header(mut self, has_header: bool) -> Self {
-        self.header = has_header;
+        self.options.header = has_header;
         self
     }
 
@@ -56,8 +70,10 @@ where
         self
     }
 
+    /// Set the CSV writer's batch size, or the number of rows that will be written as a time. Larger batch sizes lead
+    /// to faster writing overall but also use more memory.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
-        self.batch_size = batch_size;
+        self.options.batch_size = batch_size;
         self
     }
 
