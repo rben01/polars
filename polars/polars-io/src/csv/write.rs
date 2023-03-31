@@ -16,6 +16,8 @@ use super::*;
 /// batch_size: 1024
 /// ```
 ///
+/// Use the `with_` methods to overwrite these options.
+///
 /// ## Note
 /// Don't use a `Buffered` writer, the `CsvWriter` internally already buffers writes.
 #[must_use]
@@ -30,6 +32,7 @@ impl<W> SerWriter<W> for CsvWriter<W>
 where
     W: Write,
 {
+    /// Create a new `CsvWriter` with the default [`CsvWriterOptions`]
     fn new(buffer: W) -> Self {
         // 9f: all nanoseconds
         let options = CsvWriterOptions {
@@ -53,6 +56,7 @@ impl<W> CsvWriter<W>
 where
     W: Write,
 {
+    /// Set all options at once. All existing values will be overwritten by the provided `options`.
     pub fn with_options(mut self, options: CsvWriterOptions) -> Self {
         self.options = options;
         self

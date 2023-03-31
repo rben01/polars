@@ -303,7 +303,7 @@ pub(crate) fn write<W: Write>(
             let mut finished = false;
             // loop rows
             while !finished {
-                for col in &mut col_iters.iter_mut() {
+                for col in &mut col_iters {
                     match col.next() {
                         Some(value) => {
                             write_anyvalue(&mut write_buffer, value, options)?;
