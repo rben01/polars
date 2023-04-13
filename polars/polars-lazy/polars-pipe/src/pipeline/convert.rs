@@ -316,7 +316,7 @@ where
             let aggregation_columns = Arc::new(aggregation_columns);
 
             match (
-                output_schema.get_index(0).unwrap().1.to_physical(),
+                output_schema.get_at_index(0).unwrap().1.to_physical(),
                 keys.len(),
             ) {
                 (dt, 1) if dt.is_integer() => {
